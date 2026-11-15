@@ -5,7 +5,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.InputStream
 
-class FastbootSimulatedDevice : FastbootDevice {
+class FastbootSimulatedDevice(
+    private val hasDynamicPartitions: Boolean = true
+) : FastbootDevice {
 
     private var connected = true
     private var isUserspaceMode = false
@@ -51,6 +53,10 @@ class FastbootSimulatedDevice : FastbootDevice {
                     "current-slot" -> activeSlot
                     "slot-count" -> "2"
                     "is-userspace" -> if (isUserspaceMode) "yes" else "no"
+                    "super-partition-name" -> if (hasDynamicPartitions) "super" else ""
+                    "partition-size:super" -> if (hasDynamicPartitions) "0x40000000" else ""
+                    "partition-type:system" -> if (hasDynamicPartitions) "" else "raw"
+                    "partition-size:system" -> if (hasDynamicPartitions) "" else "0x80000000"
                     "max-download-size" -> "0x20000000" // 512 MB
                     "unlocked" -> "yes"
                     "secure" -> "no"

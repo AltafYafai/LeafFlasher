@@ -1424,6 +1424,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     fileName.contains("super_empty", ignoreCase = true)
 
                 if (isSuperWipe) {
+                    if (FastbootCapabilities.supportsDynamicPartitions(activeDevice) == false) {
+                        succeeded = false
+                        flashExecutor.addLog("✗ This device has no super partition (legacy partition layout)")
+                        return@launch
+                    }
                     _singlePartitionStatusText.value = "Wiping super partition..."
                     flashExecutor.addLog("Wiping super partition...")
                     activeDevice.sendCommand("snapshot-update:cancel")
@@ -1470,8 +1475,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 // Switch Bootloader -> Fastbootd automatically if flashing a logical dynamic partition
-                val isLogical = FlashExecutor.isLogicalPartitionTarget(partitionStem)
-                if (isLogical && usbManager.modeFlow.value == FastbootMode.BOOTLOADER) {
+                val isLogicalTarget = FlashExecutor.isLogicalPartitionTarget(partitionStem)
+                val useFastbootd = if (!isLogicalTarget) {
+                    false
+                } else if (usbManager.modeFlow.value == FastbootMode.FASTBOOTD) {
+                    true
+                } else {
+                    val detected = FastbootCapabilities.supportsDynamicPartitions(activeDevice)
+                    if (detected == false) {
+                        flashExecutor.addLog(
+                            "Legacy partition layout detected — flashing $partitionStem in bootloader"
+                        )
+                    }
+                    detected != false
+                }
+                if (isLogicalTarget && useFastbootd && usbManager.modeFlow.value == FastbootMode.BOOTLOADER) {
                     _singlePartitionStatusText.value = "Rebooting to Fastbootd..."
                     flashExecutor.addLog("Rebooting to Fastbootd...")
                     activeDevice.reboot("fastboot")
@@ -1523,7 +1541,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 flashExecutor.addLog("Flashing $activeTarget...")
 
                 suspend fun prepareAndFlash(partName: String): FastbootResponse {
-                    val logicalTarget = FlashExecutor.isLogicalPartitionTarget(partName)
+                    val logicalTarget = useFastbootd && FlashExecutor.isLogicalPartitionTarget(partName)
                     var targetPartSize = fileSize
                     if (logicalTarget) {
                         activeDevice.sendCommand("snapshot-update:cancel")
@@ -1975,6 +1993,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             val dev = requireFastbootDevice("Reboot") ?: return@launch
+            if (targetLower == "fastboot" || targetLower == "fastbootd") {
+                if (FastbootCapabilities.supportsDynamicPartitions(dev) == false) {
+                    flashExecutor.addLog("✗ This device has no fastbootd (legacy partition layout) — staying in bootloader")
+                    return@launch
+                }
+            }
             flashExecutor.addLog("Rebooting to $label...")
             dev.reboot(target)
 
