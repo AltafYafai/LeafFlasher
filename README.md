@@ -258,15 +258,31 @@ chmod +x gradlew
 # 3. Run the unit test suite
 ./gradlew testDebugUnitTest
 
-# 4. Build the release APK (unsigned unless LEAF_KEYSTORE_* env vars are set)
+# 4. Build the release APK (signed with LEAF_KEYSTORE_* when configured,
+#    otherwise with your local Android debug key so the APK stays installable)
 ./gradlew assembleRelease
 
 # Or build a debug APK
 ./gradlew assembleDebug
 ```
 
-The compiled release APK is output to:
-`app/build/outputs/apk/release/app-release.apk` (or `app-release-unsigned.apk` when no signing environment variables are provided).
+The compiled release APK is output to `app/build/outputs/apk/release/app-release.apk`.
+It is always signed: either with your release keystore or, when no keystore is provided,
+with the local Android debug key. Unsigned `app-release-unsigned.apk` builds are no longer emitted because Android rejects them with **"package appears to be invalid"**.
+
+For official releases with upgrade-stable signing, generate a keystore and configure it in
+GitHub Actions:
+
+```bash
+keytool -genkeypair -v -keystore leaf-release.jks -alias leaf \
+  -keyalg RSA -keysize 4096 -validity 10000
+
+base64 -w0 leaf-release.jks   # add as the LEAF_KEYSTORE_BASE64 repository secret
+```
+
+Also set `LEAF_KEYSTORE_PASSWORD`, `LEAF_KEY_ALIAS`, and `LEAF_KEY_PASSWORD` secrets. Without
+those secrets CI still publishes an installable APK, but it uses a temporary CI debug key, so
+switching to a permanent release key later requires uninstalling the old build once.
 
 On Windows PowerShell, use `.\gradlew.bat testDebugUnitTest assembleRelease`.
 
