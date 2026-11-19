@@ -68,6 +68,27 @@ class FlashExecutor(
             val clean = target.lowercase().removeSuffix("_a").removeSuffix("_b")
             return clean in KNOWN_LOGICAL_STEMS
         }
+
+        fun requiresFastbootd(tasks: List<FlashTask>): Boolean = tasks.any {
+            it.type == TaskType.REBOOT_FASTBOOT ||
+                it.phase == FlashingPhase.LOGICAL_DYNAMIC ||
+                it.type == TaskType.DELETE_LOGICAL ||
+                it.type == TaskType.CREATE_LOGICAL ||
+                it.type == TaskType.RESIZE_LOGICAL ||
+                (it.type == TaskType.FLASH && isLogicalPartitionTarget(it.partition))
+        }
+
+        /**
+         * Legacy devices (physical system/vendor, no super partition) have no fastbootd.
+         * Their logical-looking partitions are flashed directly from the bootloader.
+         */
+        fun applyLegacyBootloaderLayout(tasks: List<FlashTask>) {
+            for (task in tasks) {
+                if (task.phase == FlashingPhase.LOGICAL_DYNAMIC) {
+                    task.phase = FlashingPhase.FIRMWARE_BOOTLOADER
+                }
+            }
+        }
     }
 
     private val fileResolverMap = ConcurrentHashMap<String, Uri>()
@@ -201,6 +222,22 @@ class FlashExecutor(
             val flashCount = FlashScriptParser.countUniquePartitions(tasks).takeIf { it > 0 } ?: tasks.size
             addLog("Flashing $flashCount partitions...")
 
+            // Legacy devices keep system/vendor as physical partitions and have no fastbootd.
+            // Detect that early so we never send "reboot fastboot" (which lands in recovery on
+            // those bootloaders) and flash their partitions directly from the bootloader.
+            val fastbootdSupported = if (!requiresFastbootd(tasks) ||
+                activeDevice.currentMode == FastbootMode.FASTBOOTD
+            ) {
+                true
+            } else {
+                val detected = FastbootCapabilities.supportsDynamicPartitions(activeDevice)
+                if (detected == false) {
+                    addLog("Legacy partition layout detected — flashing in bootloader (no fastbootd)")
+                    applyLegacyBootloaderLayout(tasks)
+                }
+                detected != false
+            }
+
             _progressFlow.value = ExecutionProgress(
                 currentStep = 0,
                 totalSteps = tasks.size,
@@ -274,6 +311,12 @@ class FlashExecutor(
                             }
 
                             if (isSuperWipe) {
+                                if (!fastbootdSupported) {
+                                    task.status = TaskStatus.SKIPPED
+                                    task.errorMessage = "No super partition on this device"
+                                    addLog("Skipping super wipe (legacy partition layout)")
+                                    continue
+                                }
                                 addLog("Wiping super partition...")
                                 _progressFlow.value = _progressFlow.value.copy(
                                     statusMessage = "Wiping super partition..."
@@ -352,9 +395,10 @@ class FlashExecutor(
                                 continue
                             }
 
-                            val isLogical = task.phase == FlashingPhase.LOGICAL_DYNAMIC || isLogicalPartitionTarget(initialTarget)
+                            val isLogicalTarget = task.phase == FlashingPhase.LOGICAL_DYNAMIC ||
+                                isLogicalPartitionTarget(initialTarget)
                             // Per AOSP fastboot.cpp: resolve un-suffixed logical partitions to active slot in fastbootd
-                            if (isLogical && !initialTarget.endsWith("_a") && !initialTarget.endsWith("_b")) {
+                            if (isLogicalTarget && !initialTarget.endsWith("_a") && !initialTarget.endsWith("_b")) {
                                 val hasSlot = activeDevice.getVariable("has-slot:$initialTarget")?.equals("yes", ignoreCase = true) == true
                                 if (hasSlot) {
                                     val resolvedSlot = liveSlotCache
@@ -364,6 +408,10 @@ class FlashExecutor(
                                     initialTarget = "${initialTarget}_$resolvedSlot"
                                 }
                             }
+
+                            // Legacy devices flash their physical partitions from the bootloader;
+                            // logical resize/create and snapshot commands must not run there.
+                            val isLogical = fastbootdSupported && isLogicalTarget
 
                             addLog("Flashing $initialTarget...")
 
@@ -609,42 +657,47 @@ class FlashExecutor(
                         }
 
                         TaskType.REBOOT_FASTBOOT -> {
-                            addLog("Rebooting to Fastbootd...")
-                            activeDevice.reboot("fastboot")
+                            if (!fastbootdSupported) {
+                                task.status = TaskStatus.SKIPPED
+                                addLog("Skipping Fastbootd reboot (device already in bootloader)")
+                            } else {
+                                addLog("Rebooting to Fastbootd...")
+                                activeDevice.reboot("fastboot")
 
-                            _progressFlow.value = _progressFlow.value.copy(
-                                state = FlashExecutionState.WAITING_FOR_RECONNECT,
-                                statusMessage = "Waiting for Fastbootd..."
-                            )
+                                _progressFlow.value = _progressFlow.value.copy(
+                                    state = FlashExecutionState.WAITING_FOR_RECONNECT,
+                                    statusMessage = "Waiting for Fastbootd..."
+                                )
 
-                            val reconnectedDevice = usbManager.waitForReconnection(
-                                expectedMode = FastbootMode.FASTBOOTD,
-                                onStatusUpdate = { status ->
-                                    _progressFlow.value = _progressFlow.value.copy(statusMessage = status)
-                                }
-                            )
+                                val reconnectedDevice = usbManager.waitForReconnection(
+                                    expectedMode = FastbootMode.FASTBOOTD,
+                                    onStatusUpdate = { status ->
+                                        _progressFlow.value = _progressFlow.value.copy(statusMessage = status)
+                                    }
+                                )
 
-                            if (reconnectedDevice != null) {
-                                val fdInfo = usbManager.deviceInfoFlow.value ?: reconnectedDevice.fetchDeviceInfo()
-                                if (!fdInfo.isVerifiedFastboot || !fdInfo.isUserspace) {
+                                if (reconnectedDevice != null) {
+                                    val fdInfo = usbManager.deviceInfoFlow.value ?: reconnectedDevice.fetchDeviceInfo()
+                                    if (!fdInfo.isVerifiedFastboot || !fdInfo.isUserspace) {
+                                        task.status = TaskStatus.FAILED
+                                        task.errorMessage = "Device did not enter Fastbootd mode"
+                                        addLog("✗ Device did not enter Fastbootd mode")
+                                        success = false
+                                        break
+                                    }
+                                    activeDevice = reconnectedDevice
+                                    fdInfo.currentSlot.takeIf { it.equals("a", true) || it.equals("b", true) }?.let {
+                                        liveSlotCache = it.lowercase()
+                                    }
+                                    task.status = TaskStatus.COMPLETED
+                                    addLog("✓ Connected to Fastbootd")
+                                } else {
                                     task.status = TaskStatus.FAILED
-                                    task.errorMessage = "Device did not enter Fastbootd mode"
-                                    addLog("✗ Device did not enter Fastbootd mode")
+                                    task.errorMessage = "Timed out waiting for Fastbootd"
+                                    addLog("✗ Fastbootd reconnect timed out")
                                     success = false
                                     break
                                 }
-                                activeDevice = reconnectedDevice
-                                fdInfo.currentSlot.takeIf { it.equals("a", true) || it.equals("b", true) }?.let {
-                                    liveSlotCache = it.lowercase()
-                                }
-                                task.status = TaskStatus.COMPLETED
-                                addLog("✓ Connected to Fastbootd")
-                            } else {
-                                task.status = TaskStatus.FAILED
-                                task.errorMessage = "Timed out waiting for Fastbootd"
-                                addLog("✗ Fastbootd reconnect timed out")
-                                success = false
-                                break
                             }
                         }
 
@@ -713,14 +766,25 @@ class FlashExecutor(
                         }
 
                         TaskType.RAW, TaskType.DELETE_LOGICAL, TaskType.CREATE_LOGICAL, TaskType.RESIZE_LOGICAL -> {
-                            val resp = activeDevice.sendCommand(task.rawCommandLine)
-                            if (resp.isSuccess) {
-                                task.status = TaskStatus.COMPLETED
-                                addLog("✓ ${task.displayName}")
+                            if (!fastbootdSupported &&
+                                task.type in setOf(
+                                    TaskType.DELETE_LOGICAL,
+                                    TaskType.CREATE_LOGICAL,
+                                    TaskType.RESIZE_LOGICAL
+                                )
+                            ) {
+                                task.status = TaskStatus.SKIPPED
+                                addLog("Skipping ${task.displayName} (no fastbootd)")
                             } else {
-                                task.status = TaskStatus.FAILED
-                                task.errorMessage = resp.payload
-                                addLog("✗ Failed: ${resp.payload}")
+                                val resp = activeDevice.sendCommand(task.rawCommandLine)
+                                if (resp.isSuccess) {
+                                    task.status = TaskStatus.COMPLETED
+                                    addLog("✓ ${task.displayName}")
+                                } else {
+                                    task.status = TaskStatus.FAILED
+                                    task.errorMessage = resp.payload
+                                    addLog("✗ Failed: ${resp.payload}")
+                                }
                             }
                         }
                     }

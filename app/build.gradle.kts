@@ -53,7 +53,11 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfigs.findByName("release")?.let { signingConfig = it }
+            // Always produce an installable APK. When no release keystore is supplied,
+            // fall back to the debug key instead of emitting app-release-unsigned.apk,
+            // which Android rejects with "package appears to be invalid".
+            signingConfig = signingConfigs.findByName("release")
+                ?: signingConfigs.getByName("debug")
         }
         debug {
             isMinifyEnabled = false

@@ -78,6 +78,7 @@ jobs:
             echo "HAS_SIGNING_KEY=true" >> "$GITHUB_ENV"
           else
             echo "HAS_SIGNING_KEY=false" >> "$GITHUB_ENV"
+            echo "::warning::No LEAF_KEYSTORE_BASE64 secret configured. The release APK will be signed with the CI debug key so it stays installable; configure LEAF_KEYSTORE_* secrets for stable production signing."
           fi
 
       - name: Build Android Release APK
@@ -86,6 +87,18 @@ jobs:
           LEAF_KEY_ALIAS: ${{ secrets.LEAF_KEY_ALIAS }}
           LEAF_KEY_PASSWORD: ${{ secrets.LEAF_KEY_PASSWORD }}
         run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Verify APK Signature
+        shell: bash
+        run: |
+          APK="app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "${APK}" ]; then
+            echo "Signed release APK not found at ${APK}" >&2
+            echo "Refusing to publish an unsigned or missing APK." >&2
+            exit 1
+          fi
+          APKSIGNER="${ANDROID_HOME}/build-tools/34.0.0/apksigner"
+          "${APKSIGNER}" verify --verbose --print-certs "${APK}"
 
       - name: Package APK & SHA-256 Checksum
         shell: bash
@@ -105,10 +118,8 @@ jobs:
           APK_NAME="LeafFlasher-by-sid-${TAG_NAME}.apk"
           if [ -f app/build/outputs/apk/release/app-release.apk ]; then
             cp app/build/outputs/apk/release/app-release.apk "dist/${APK_NAME}"
-          elif [ -f app/build/outputs/apk/release/app-release-unsigned.apk ]; then
-            cp app/build/outputs/apk/release/app-release-unsigned.apk "dist/${APK_NAME}"
           else
-            echo "Release APK output not found!" >&2
+            echo "Signed release APK output not found; refusing to publish an unsigned APK!" >&2
             exit 1
           fi
 
@@ -151,6 +162,10 @@ jobs:
             echo "- **APK:** \`${APK_NAME}\` (\`versionCode ${VERSION_CODE}\`)"
             echo "- **SHA-256:** \`${APK_SHA256}\`"
             echo ''
+            if [ "${HAS_SIGNING_KEY}" != "true" ]; then
+              echo '> **Signing note:** No release keystore secret is configured, so this APK is signed with the CI debug key. Uninstall any previous debug-key build before installing if Android reports a signature mismatch.'
+              echo ''
+            fi
             echo '```bash'
             echo "sha256sum -c ${APK_NAME}.sha256"
             echo '```'

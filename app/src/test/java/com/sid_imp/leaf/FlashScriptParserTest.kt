@@ -967,6 +967,53 @@ class FlashScriptParserTest {
     }
 
     @Test
+    fun testFastbootCapabilitiesDetectDynamicAndLegacyLayouts() = runBlocking {
+        val dynamicDevice = FastbootSimulatedDevice(hasDynamicPartitions = true)
+        assertEquals(
+            true,
+            FastbootCapabilities.supportsDynamicPartitions(dynamicDevice)
+        )
+        dynamicDevice.close()
+
+        val legacyDevice = FastbootSimulatedDevice(hasDynamicPartitions = false)
+        assertEquals(
+            false,
+            FastbootCapabilities.supportsDynamicPartitions(legacyDevice)
+        )
+        // A legacy device must never be treated as fastbootd-capable, even after a probe.
+        assertEquals(FastbootMode.BOOTLOADER, legacyDevice.currentMode)
+        legacyDevice.close()
+    }
+
+    @Test
+    fun testLegacyLayoutReclassifiesFastbootdTasksForBootloader() {
+        val script = """
+            fastboot flash boot_a boot.img
+            fastboot reboot fastboot
+            fastboot flash system_a system.img
+            fastboot flash vendor_a vendor.img
+            fastboot --set-active=a
+            fastboot reboot
+        """.trimIndent()
+
+        val tasks = FlashScriptParser.parseScript(script)
+        assertTrue(FlashExecutor.requiresFastbootd(tasks))
+        assertTrue(tasks.any { it.phase == FlashingPhase.LOGICAL_DYNAMIC })
+
+        FlashExecutor.applyLegacyBootloaderLayout(tasks)
+
+        assertFalse(
+            "Legacy devices must flash system/vendor from the bootloader",
+            tasks.any { it.phase == FlashingPhase.LOGICAL_DYNAMIC }
+        )
+        assertTrue(
+            tasks.filter { it.type == TaskType.FLASH }.all { it.phase == FlashingPhase.FIRMWARE_BOOTLOADER }
+        )
+        // The reboot fastboot task is still present in the plan but is skipped at runtime.
+        assertTrue(tasks.any { it.type == TaskType.REBOOT_FASTBOOT })
+    }
+
+    @Test
     fun testLeafUiMetricsAdaptationAcrossDisplayConfigs() {
         val compact320 = com.sid_imp.leaf.ui.theme.computeLeafUiMetrics(
             screenWidthDp = 320,

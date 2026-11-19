@@ -150,6 +150,7 @@ Leaf Flasher builds the entire Fastboot, FastbootD, Sparse image, OTA `payload.b
 - **Color-Coded Top Status Card:** Turns emerald green for Fastboot / FastbootD, ocean blue for ADB / Recovery Sideload, amber while awaiting authorization or reboot reconnection, and crimson when no target phone is plugged in.
 - **Strict Hardware Safety Filtering:** Matches only verified Fastboot (`Class 255 / Subclass 66 / Protocol 3`) and ADB (`Class 255 / Subclass 66 / Protocol 1`) USB endpoints while explicitly ignoring MediaTek BROM / Preloader ports (`0x0003`, `0x2000`, `0x2001`) and MTP interfaces so it never touches the wrong USB device.
 - **Seamless Fastboot to FastbootD Re-Linking:** Automatically waits for USB re-enumeration when rebooting between Bootloader and FastbootD mid-flash, resuming without user intervention.
+- **Legacy Device Awareness:** Detects older devices without dynamic partitions / fastbootd and flashes their physical `system`, `vendor`, and other images directly from the Bootloader instead of incorrectly rebooting to recovery.
 - **Adaptive USB Transfer Chunking:** Starts with high-throughput bulk transfers and automatically steps down chunk sizes (`16 KB -> 4 KB -> 1 KB / 512 B`) if a host phone's USB OTG controller drops packets.
 
 ### 2. Unified ROM Browser (Phone Storage, Downloads & SD Card)
@@ -257,15 +258,31 @@ chmod +x gradlew
 # 3. Run the unit test suite
 ./gradlew testDebugUnitTest
 
-# 4. Build the release APK (unsigned unless LEAF_KEYSTORE_* env vars are set)
+# 4. Build the release APK (signed with LEAF_KEYSTORE_* when configured,
+#    otherwise with your local Android debug key so the APK stays installable)
 ./gradlew assembleRelease
 
 # Or build a debug APK
 ./gradlew assembleDebug
 ```
 
-The compiled release APK is output to:
-`app/build/outputs/apk/release/app-release.apk` (or `app-release-unsigned.apk` when no signing environment variables are provided).
+The compiled release APK is output to `app/build/outputs/apk/release/app-release.apk`.
+It is always signed: either with your release keystore or, when no keystore is provided,
+with the local Android debug key. Unsigned `app-release-unsigned.apk` builds are no longer emitted because Android rejects them with **"package appears to be invalid"**.
+
+For official releases with upgrade-stable signing, generate a keystore and configure it in
+GitHub Actions:
+
+```bash
+keytool -genkeypair -v -keystore leaf-release.jks -alias leaf \
+  -keyalg RSA -keysize 4096 -validity 10000
+
+base64 -w0 leaf-release.jks   # add as the LEAF_KEYSTORE_BASE64 repository secret
+```
+
+Also set `LEAF_KEYSTORE_PASSWORD`, `LEAF_KEY_ALIAS`, and `LEAF_KEY_PASSWORD` secrets. Without
+those secrets CI still publishes an installable APK, but it uses a temporary CI debug key, so
+switching to a permanent release key later requires uninstalling the old build once.
 
 On Windows PowerShell, use `.\gradlew.bat testDebugUnitTest assembleRelease`.
 
