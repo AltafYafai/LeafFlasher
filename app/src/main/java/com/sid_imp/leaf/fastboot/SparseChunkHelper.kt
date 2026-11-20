@@ -78,10 +78,11 @@ object SparseChunkHelper {
         }
 
         // 12-byte CHUNK_TYPE_RAW
+        val alignedWireBytes = chunkBlocks * BLOCK_SIZE
         buffer.putShort(CHUNK_TYPE_RAW)
         buffer.putShort(0.toShort()) // reserved1
         buffer.putInt(chunkBlocks.toInt()) // chunk_sz (blocks)
-        buffer.putInt((12L + sliceDataBytes).toInt()) // total_sz (header + data)
+        buffer.putInt((12L + alignedWireBytes).toInt()) // total_sz (header + aligned data)
 
         return buffer.array()
     }

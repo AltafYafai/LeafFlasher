@@ -1569,7 +1569,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         }
                         targetPartSize = SparseChunkHelper.computeTargetPartitionSize(headerBytes, fileSize)
 
-                        val resizeResp = activeDevice.sendCommand("resize-logical-partition:$partName:$targetPartSize")
+                        var resizeResp = activeDevice.sendCommand("resize-logical-partition:$partName:$targetPartSize")
                         if (!resizeResp.isSuccess) {
                             val payload = resizeResp.payload.lowercase()
                             if (payload.contains("lock") || payload.contains("not allowed")) {
@@ -1580,10 +1580,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                                 payload.contains("unknown partition") ||
                                 payload.contains("failed to find")
                             ) {
-                                val createResp = activeDevice.sendCommand("create-logical-partition:$partName:$targetPartSize")
-                                if (!createResp.isSuccess &&
-                                    (createResp.payload.contains("lock", true) || createResp.payload.contains("not allowed", true))
-                                ) {
+                                var createResp = activeDevice.sendCommand("create-logical-partition:$partName:$targetPartSize")
+                                if (!createResp.isSuccess) {
+                                    val cPayload = createResp.payload.lowercase()
+                                    if (cPayload.contains("no space") || cPayload.contains("not enough space")) {
+                                        val oppSlot = if (partName.endsWith("_a")) "b" else "a"
+                                        for (stem in listOf("product", "system_ext", "system", "vendor", "vendor_dlkm", "odm_dlkm", "odm")) {
+                                            activeDevice.sendCommand("delete-logical-partition:${stem}_$oppSlot")
+                                        }
+                                        createResp = activeDevice.sendCommand("create-logical-partition:$partName:$targetPartSize")
+                                    }
+                                }
+                                if (!createResp.isSuccess) {
                                     return createResp
                                 }
                             } else if (payload.contains("no space") || payload.contains("not enough space")) {
@@ -1591,7 +1599,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                                 for (stem in listOf("product", "system_ext", "system", "vendor", "vendor_dlkm", "odm_dlkm", "odm")) {
                                     activeDevice.sendCommand("delete-logical-partition:${stem}_$oppSlot")
                                 }
-                                activeDevice.sendCommand("resize-logical-partition:$partName:$targetPartSize")
+                                resizeResp = activeDevice.sendCommand("resize-logical-partition:$partName:$targetPartSize")
+                                if (!resizeResp.isSuccess) {
+                                    activeDevice.sendCommand("delete-logical-partition:$partName")
+                                    resizeResp = activeDevice.sendCommand("create-logical-partition:$partName:$targetPartSize")
+                                }
+                                if (!resizeResp.isSuccess) {
+                                    return resizeResp
+                                }
+                            } else {
+                                return resizeResp
                             }
                         }
                     }

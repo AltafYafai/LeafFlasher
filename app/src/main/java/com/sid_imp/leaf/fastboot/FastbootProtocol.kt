@@ -355,7 +355,8 @@ class FastbootUsbDevice(
         }
 
         // If file fits within hardware download limit, or is an already-sparse image fitting in device buffer, flash directly!
-        if (totalBytes <= maxChunkLimit || (isAlreadySparse && (queriedLimit <= 0 || totalBytes <= queriedLimit))) {
+        val canFlashDirectly = totalBytes <= maxChunkLimit || (isAlreadySparse && (queriedLimit <= 0 || totalBytes <= maxOf(queriedLimit, 1024 * 1024 * 1024L)))
+        if (canFlashDirectly) {
             val stream = openStream() ?: return@withContext FastbootResponse(ResponseType.ERROR, "Cannot open stream for $partition")
             return@withContext try {
                 flashPartition(partition, stream, totalBytes, progressCallback, infoCallback)
@@ -378,9 +379,10 @@ class FastbootUsbDevice(
             val sliceDataBytes = minOf(sliceSize, totalBytes - sliceOffset)
             val startBlock = sliceOffset / SparseChunkHelper.BLOCK_SIZE
             val chunkBlocks = (sliceDataBytes + SparseChunkHelper.BLOCK_SIZE - 1) / SparseChunkHelper.BLOCK_SIZE
+            val chunkAlignedDataBytes = chunkBlocks * SparseChunkHelper.BLOCK_SIZE
 
             val chunkHeader = SparseChunkHelper.createRawSliceHeader(startBlock, chunkBlocks, sliceDataBytes)
-            val chunkTotalWireBytes = chunkHeader.size.toLong() + sliceDataBytes
+            val chunkTotalWireBytes = chunkHeader.size.toLong() + chunkAlignedDataBytes
 
             // Open stream and seek/skip BEFORE locking & sending download command
             val inStream = openStream() ?: return@withContext FastbootResponse(ResponseType.ERROR, "Cannot open stream at chunk ${sliceIndex + 1}")
@@ -471,7 +473,19 @@ class FastbootUsbDevice(
                         }
                     }
 
-                    if (bytesUploadedThisSlice != sliceDataBytes) {
+                    // Pad remaining bytes up to chunkAlignedDataBytes with zeros (per AOSP libsparse format)
+                    if (bytesUploadedThisSlice < chunkAlignedDataBytes && connected) {
+                        val zeroPad = ByteArray(minOf(FastbootConstants.BULK_CHUNK_SIZE.toLong(), chunkAlignedDataBytes - bytesUploadedThisSlice).toInt())
+                        while (bytesUploadedThisSlice < chunkAlignedDataBytes && connected) {
+                            val toPad = minOf(zeroPad.size.toLong(), chunkAlignedDataBytes - bytesUploadedThisSlice).toInt()
+                            if (!writeBulkBuffer(zeroPad, 0, toPad)) {
+                                return@withLock FastbootResponse(ResponseType.ERROR, "Failed streaming chunk padding ${sliceIndex + 1} to USB")
+                            }
+                            bytesUploadedThisSlice += toPad
+                        }
+                    }
+
+                    if (bytesUploadedThisSlice != chunkAlignedDataBytes) {
                         return@withLock FastbootResponse(ResponseType.ERROR, "Incomplete sparse slice ${sliceIndex + 1}")
                     }
 
