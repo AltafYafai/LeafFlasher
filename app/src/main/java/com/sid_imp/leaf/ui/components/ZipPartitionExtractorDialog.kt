@@ -221,6 +221,26 @@ fun ZipPartitionExtractorDialog(
                             fontSize = metrics.captionSp.sp,
                             textAlign = TextAlign.Center
                         )
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Box(
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(OneUiInnerTile)
+                                .border(1.dp, OneUiCardSubtleRim, CircleShape)
+                                .oneUiBounceClick(pressedScale = 0.92f) {
+                                    dismiss { onDismiss() }
+                                }
+                                .padding(horizontal = 22.dp, vertical = 8.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "Cancel Scan",
+                                fontFamily = IosRoundedFontFamily,
+                                fontWeight = FontWeight.Bold,
+                                color = OneUiTextSecondary,
+                                fontSize = metrics.captionSp.sp
+                            )
+                        }
                     }
                 }
 

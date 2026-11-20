@@ -34,7 +34,7 @@ import java.util.concurrent.atomic.AtomicLong
  */
 object PayloadDumper {
 
-    private const val PAYLOAD_MAGIC = 0x43724155 // "CrAU"
+    const val PAYLOAD_MAGIC = 0x43724155 // "CrAU"
 
     // Global reusable BasicArrayCache for genuine LZMA2/XZ buffer pooling
     private val xzArrayCache = BasicArrayCache.getInstance()
@@ -136,7 +136,7 @@ object PayloadDumper {
         val manifestSize = bb.getLong()
         val metadataSignatureSize = if (fileFormatVersion >= 2L) bb.getInt() else 0
         val manifestOffset = if (fileFormatVersion >= 2L) 24L else 20L
-        if (manifestSize <= 0L || manifestSize > 256L * 1024 * 1024) {
+        if (manifestSize <= 0L || manifestSize > 64L * 1024 * 1024) {
             throw IllegalStateException("Invalid manifest size: $manifestSize")
         }
         val dataOffsetStart = manifestOffset + manifestSize + metadataSignatureSize
@@ -206,7 +206,7 @@ object PayloadDumper {
         if (fileFormatVersion >= 2L) {
             readExactFromStream(stream, 4) // metadata signature size
         }
-        if (manifestSize <= 0L || manifestSize > 256L * 1024 * 1024) {
+        if (manifestSize <= 0L || manifestSize > 64L * 1024 * 1024) {
             throw IllegalStateException("Invalid manifest size: $manifestSize")
         }
         val manifestBytes = readExactFromStream(stream, manifestSize.toInt())
@@ -276,7 +276,7 @@ object PayloadDumper {
         val metadataSignatureSize = if (fileFormatVersion >= 2L) {
             ByteBuffer.wrap(readExactFromStream(stream, 4)).getInt()
         } else 0
-        if (manifestSize <= 0L || manifestSize > 256L * 1024 * 1024) {
+        if (manifestSize <= 0L || manifestSize > 64L * 1024 * 1024) {
             throw IllegalStateException("Invalid manifest size: $manifestSize")
         }
         val manifestBytes = readExactFromStream(stream, manifestSize.toInt())
@@ -549,8 +549,12 @@ object PayloadDumper {
             }
         }
 
-        // High-throughput multi-core parallelism (up to 6 concurrent partition workers)
-        val maxConcurrency = maxOf(2, minOf(6, Runtime.getRuntime().availableProcessors()))
+        // High-throughput RAM-aware multi-core parallelism (Otaripper v3.6.0)
+        val maxHeap = Runtime.getRuntime().maxMemory()
+        val usedHeap = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()
+        val freeHeap = maxHeap - usedHeap
+        val memoryConstrained = freeHeap < 256L * 1024 * 1024
+        val maxConcurrency = if (memoryConstrained) 2 else maxOf(2, minOf(6, Runtime.getRuntime().availableProcessors()))
         val semaphore = Semaphore(maxConcurrency)
 
         // Prioritize firmware partitions first so device controls & fastbootd files are ready immediately
@@ -978,6 +982,10 @@ object PayloadDumper {
                 2 -> numBlocks = reader.readVarint() // uint64 num_blocks
                 else -> reader.skip(wireType)
             }
+        }
+        // Bounds and overflow check (Otaripper v3.6.0)
+        if (startBlock < 0L || numBlocks < 0L || (startBlock + numBlocks) < 0L) {
+            return null
         }
         return Extent(startBlock, numBlocks)
     }

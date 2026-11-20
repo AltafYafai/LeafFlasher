@@ -11,6 +11,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.sid_imp.leaf.fastboot.*
 import com.sid_imp.leaf.script.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -21,6 +22,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.Closeable
 import java.io.File
 import java.io.FileInputStream
@@ -1265,13 +1267,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     _selectiveOutputFolderLabel.value = "Downloads/LeafFlasher/$folderSuffix"
                 }
 
-                val inspection = RomZipExtractor.inspectRomZipPartitions(
-                    context = context,
-                    zipUri = zipUri,
-                    archiveDisplayName = archiveName
-                )
-                _isInspectingZipPartitions.value = false
-                if (inspection.success && inspection.partitions.isNotEmpty()) {
+                // Protect with 25s timeout so inspection never hangs or blocks indefinitely
+                val inspection = withTimeoutOrNull(25_000L) {
+                    RomZipExtractor.inspectRomZipPartitions(
+                        context = context,
+                        zipUri = zipUri,
+                        archiveDisplayName = archiveName
+                    )
+                }
+
+                if (inspection == null) {
+                    _inspectedZipPartitions.value = emptyList()
+                    val err = "Inspection timed out. For very large ROMs, pick the file directly."
+                    _zipInspectionError.value = err
+                    flashExecutor.addLog("✗ Inspection timed out for $archiveName")
+                } else if (inspection.success && inspection.partitions.isNotEmpty()) {
                     _inspectedZipPartitions.value = inspection.partitions
                     _zipInspectionError.value = null
                     flashExecutor.addLog("✓ Indexed ${inspection.partitions.size} partitions in $archiveName")
@@ -1281,11 +1291,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     _zipInspectionError.value = err
                     flashExecutor.addLog("✗ Cannot read $archiveName: $err")
                 }
+            } catch (ce: CancellationException) {
+                // User dismissed or aborted inspection
             } catch (e: Exception) {
-                _isInspectingZipPartitions.value = false
                 val err = e.message ?: "Failed to inspect ZIP archive"
                 _zipInspectionError.value = err
                 flashExecutor.addLog("✗ Cannot read ZIP: $err")
+            } finally {
+                _isInspectingZipPartitions.value = false
             }
         }
     }
@@ -2048,8 +2061,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 } else {
                     rawTrim
                 }
-                if (cleanAdb.isEmpty()) return@launch
+                if (cleanAdb.isEmpty()) {
+                    flashExecutor.addLog("> adb (supported: shell <cmd>, reboot [bootloader|recovery|sideload], devices)")
+                    return@launch
+                }
                 flashExecutor.addLog("> adb $cleanAdb")
+
+                if (cleanAdb.equals("devices", ignoreCase = true)) {
+                    val serial = usbManager.deviceInfoFlow.value?.serialNumber?.takeIf { it.isNotBlank() && it != "Unknown" }
+                        ?: try { adb.usbDevice.serialNumber } catch (_: Exception) { null }
+                        ?: "adb-device"
+                    flashExecutor.addLog("$serial\tdevice")
+                    flashExecutor.addLog("✓ OK")
+                    return@launch
+                }
 
                 val (ok, output) = adb.executeCommand(cleanAdb)
                 val lines = output.lines().map { it.trimEnd() }.filter { it.isNotBlank() }
@@ -2070,19 +2095,78 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val dev = requireFastbootDevice("Command") ?: return@launch
             var clean = rawTrim
             if (clean.startsWith("fastboot", ignoreCase = true)) {
-                clean = clean.substring("fastboot".length).trim()
+                clean = clean.substring("fastboot".length).trimStart(' ', ':', '\t')
             }
-            if (clean.isEmpty()) return@launch
+            if (clean.isEmpty()) {
+                flashExecutor.addLog("> fastboot (supported: erase <part>, -w, getvar all, set_active <a|b>, reboot, oem, flashing, devices)")
+                return@launch
+            }
             flashExecutor.addLog("> fastboot $clean")
+
+            // 1. Devices query
+            if (clean.equals("devices", ignoreCase = true)) {
+                val serial = dev.serialNumber.ifBlank { usbManager.deviceInfoFlow.value?.serialNumber?.takeIf { it.isNotBlank() && it != "Unknown" } ?: "fastboot-device" }
+                val isUserspace = usbManager.modeFlow.value == FastbootMode.FASTBOOTD
+                val modeStr = if (isUserspace) "fastbootd" else "fastboot"
+                flashExecutor.addLog("$serial\t$modeStr")
+                flashExecutor.addLog("✓ OK")
+                return@launch
+            }
+
+            // 2. Wipe data (-w or --wipe or wipe)
+            if (clean == "-w" || clean.equals("--wipe", ignoreCase = true) || clean.equals("wipe", ignoreCase = true)) {
+                flashExecutor.addLog("Wiping userdata, metadata, cache (-w)...")
+                val r1 = dev.sendCommand("erase:userdata") { info -> if (info.isNotBlank()) flashExecutor.addLog(info) }
+                val r2 = dev.sendCommand("erase:metadata") { info -> if (info.isNotBlank()) flashExecutor.addLog(info) }
+                val r3 = dev.sendCommand("erase:cache") { info -> if (info.isNotBlank()) flashExecutor.addLog(info) }
+                if (r1.isSuccess || r2.isSuccess || r3.isSuccess) {
+                    flashExecutor.addLog("✓ Userdata wipe completed")
+                } else {
+                    flashExecutor.addLog("✗ Wipe failed: ${r1.payload.ifBlank { r2.payload }}")
+                }
+                return@launch
+            }
+
+            // 3. Informational flash hint
+            if (clean.startsWith("flash ", ignoreCase = true)) {
+                flashExecutor.addLog("ℹ Use the Partition Flasher tab to select and flash images to partitions.")
+                return@launch
+            }
+
+            // 4. Help command
+            if (clean.equals("help", ignoreCase = true) || clean.equals("--help", ignoreCase = true) || clean == "-h") {
+                flashExecutor.addLog("Commands supported (with or without 'fastboot'):")
+                flashExecutor.addLog("  erase <partition>               e.g. erase frp, erase userdata")
+                flashExecutor.addLog("  -w                              Wipe userdata, metadata and cache")
+                flashExecutor.addLog("  getvar all | getvar <var>       Query bootloader variables")
+                flashExecutor.addLog("  set_active <a|b>                Switch active boot slot")
+                flashExecutor.addLog("  reboot [bootloader|fastboot|recovery|edl]")
+                flashExecutor.addLog("  wipe-super                      Wipe dynamic partition table")
+                flashExecutor.addLog("  oem <command>                   Send OEM command")
+                flashExecutor.addLog("  flashing <unlock|lock>")
+                flashExecutor.addLog("  devices                         List connected fastboot device")
+                return@launch
+            }
 
             val wireCmd = when {
                 clean.startsWith("--set-active=", ignoreCase = true) -> "set_active:" + clean.substring("--set-active=".length).trim()
+                clean.startsWith("--set-active ", ignoreCase = true) -> "set_active:" + clean.substring("--set-active ".length).trim()
                 clean.startsWith("set_active ", ignoreCase = true) -> "set_active:" + clean.substring("set_active ".length).trim()
+                clean.startsWith("set_active:", ignoreCase = true) -> clean
+                clean.startsWith("set-active ", ignoreCase = true) -> "set_active:" + clean.substring("set-active ".length).trim()
+                clean.startsWith("set-active:", ignoreCase = true) -> "set_active:" + clean.substring("set-active:".length).trim()
+                clean.equals("getvar", ignoreCase = true) -> "getvar:all"
                 clean.startsWith("getvar ", ignoreCase = true) -> "getvar:" + clean.substring("getvar ".length).trim()
+                clean.startsWith("getvar:", ignoreCase = true) -> clean
                 clean.startsWith("erase ", ignoreCase = true) -> "erase:" + clean.substring("erase ".length).trim()
-                clean.equals("reboot bootloader", ignoreCase = true) -> "reboot-bootloader"
-                clean.equals("reboot fastboot", ignoreCase = true) -> "reboot-fastboot"
-                clean.equals("reboot recovery", ignoreCase = true) -> "reboot-recovery"
+                clean.startsWith("erase:", ignoreCase = true) -> clean
+                clean.startsWith("format ", ignoreCase = true) -> "erase:" + clean.substring("format ".length).trim()
+                clean.startsWith("format:", ignoreCase = true) -> "erase:" + clean.substring("format:".length).trim()
+                clean.equals("reboot bootloader", ignoreCase = true) || clean.equals("reboot-bootloader", ignoreCase = true) -> "reboot-bootloader"
+                clean.equals("reboot fastboot", ignoreCase = true) || clean.equals("reboot-fastboot", ignoreCase = true) -> "reboot-fastboot"
+                clean.equals("reboot recovery", ignoreCase = true) || clean.equals("reboot-recovery", ignoreCase = true) -> "reboot-recovery"
+                clean.equals("reboot edl", ignoreCase = true) || clean.equals("reboot-edl", ignoreCase = true) -> "reboot-edl"
+                clean.equals("reboot emergency", ignoreCase = true) || clean.equals("reboot-emergency", ignoreCase = true) -> "reboot-emergency"
                 clean.startsWith("wipe-super", ignoreCase = true) -> "update-super:super:wipe"
                 clean.equals("snapshot-update cancel", ignoreCase = true) || clean.equals("snapshot-update:cancel", ignoreCase = true) -> "snapshot-update:cancel"
                 clean.startsWith("delete-logical-partition ", ignoreCase = true) -> "delete-logical-partition:" + clean.substring("delete-logical-partition ".length).trim()

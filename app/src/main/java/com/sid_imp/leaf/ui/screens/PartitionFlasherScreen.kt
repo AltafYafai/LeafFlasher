@@ -755,8 +755,12 @@ fun PartitionFlasherScreen(
             originBounds = zipPickerOrigin,
             zipOnlyMode = true,
             onDismissRequest = { showZipPickerDialog = false },
-            onZipFileSelected = { zipFile -> viewModel.inspectZipFileForSingleExtract(zipFile) },
+            onZipFileSelected = { zipFile ->
+                showZipPickerDialog = false
+                viewModel.inspectZipFileForSingleExtract(zipFile)
+            },
             onLaunchSystemZipPicker = {
+                showZipPickerDialog = false
                 extractZipDocumentLauncher.launch(
                     arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream", "*/*")
                 )

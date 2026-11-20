@@ -650,17 +650,29 @@ object RomZipExtractor {
 
         // Check for ZIP64 End of Central Directory Locator (0x07064B50) before standard EOCD
         val locPos = (eocdPos - 20)
+        val eocdOffsetInFile = (fileSize - searchSize) + eocdPos
+        var zip64EocdOffset = -1L
         if (locPos >= 0 && tailBuf.getInt(locPos) == 0x07064B50) {
-            val zip64EocdOffset = tailBuf.getLong(locPos + 8)
-            if (zip64EocdOffset in 0 until fileSize) {
-                val z64Buf = ByteBuffer.allocate(56).order(ByteOrder.LITTLE_ENDIAN)
-                channel.position(zip64EocdOffset)
-                if (channel.read(z64Buf) >= 56) {
-                    z64Buf.flip()
-                    if (z64Buf.getInt(0) == 0x06064B50) {
-                        totalEntries = z64Buf.getLong(32)
-                        cdOffset = z64Buf.getLong(48)
-                    }
+            zip64EocdOffset = tailBuf.getLong(locPos + 8)
+        } else if (eocdOffsetInFile >= 20L) {
+            val locBuf = ByteBuffer.allocate(20).order(ByteOrder.LITTLE_ENDIAN)
+            channel.position(eocdOffsetInFile - 20L)
+            if (channel.read(locBuf) >= 20) {
+                locBuf.flip()
+                if (locBuf.getInt(0) == 0x07064B50) {
+                    zip64EocdOffset = locBuf.getLong(8)
+                }
+            }
+        }
+
+        if (zip64EocdOffset in 0 until fileSize) {
+            val z64Buf = ByteBuffer.allocate(56).order(ByteOrder.LITTLE_ENDIAN)
+            channel.position(zip64EocdOffset)
+            if (channel.read(z64Buf) >= 56) {
+                z64Buf.flip()
+                if (z64Buf.getInt(0) == 0x06064B50) {
+                    totalEntries = z64Buf.getLong(32)
+                    cdOffset = z64Buf.getLong(48)
                 }
             }
         }
@@ -824,7 +836,67 @@ object RomZipExtractor {
         )
     }
 
-    private fun inspectZipChannel(channel: FileChannel, archiveName: String): ZipInspectionResult {
+    internal fun isPayloadChannel(channel: FileChannel): Boolean {
+        if (channel.size() < 24L) return false
+        val buf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
+        channel.position(0L)
+        readChannelFully(channel, buf)
+        buf.flip()
+        return buf.remaining() >= 4 && buf.getInt() == PayloadDumper.PAYLOAD_MAGIC
+    }
+
+    internal fun isPayloadStream(stream: InputStream): Boolean {
+        if (!stream.markSupported()) return false
+        stream.mark(16)
+        val magicBuf = ByteArray(4)
+        var readBytes = 0
+        while (readBytes < 4) {
+            val r = stream.read(magicBuf, readBytes, 4 - readBytes)
+            if (r <= 0) break
+            readBytes += r
+        }
+        stream.reset()
+        if (readBytes < 4) return false
+        val magic = ((magicBuf[0].toInt() and 0xFF) shl 24) or
+                ((magicBuf[1].toInt() and 0xFF) shl 16) or
+                ((magicBuf[2].toInt() and 0xFF) shl 8) or
+                (magicBuf[3].toInt() and 0xFF)
+        return magic == PayloadDumper.PAYLOAD_MAGIC
+    }
+
+    internal fun inspectZipChannel(channel: FileChannel, archiveName: String): ZipInspectionResult {
+        // FAST PATH: Direct raw payload.bin file inspection in milliseconds
+        if (isPayloadChannel(channel)) {
+            val summaries = PayloadDumper.inspectPayloadFromChannel(channel, 0L, channel.size())
+            val entries = summaries.map { part ->
+                ZipPartitionEntry(
+                    id = "PAYLOAD:${part.name}",
+                    name = part.name,
+                    outputFileName = "${part.name}.img",
+                    sizeBytes = maxOf(0L, part.sizeBytes),
+                    origin = ZipPartitionOrigin.PAYLOAD_BIN,
+                    category = classifyPartitionCategory(part.name)
+                )
+            }
+            val sorted = sortZipPartitionEntries(entries)
+            return if (sorted.isEmpty()) {
+                ZipInspectionResult(
+                    success = false,
+                    archiveName = archiveName,
+                    hasPayloadBin = true,
+                    partitions = emptyList(),
+                    errorMessage = "No partition summaries found in payload.bin"
+                )
+            } else {
+                ZipInspectionResult(
+                    success = true,
+                    archiveName = archiveName,
+                    hasPayloadBin = true,
+                    partitions = sorted
+                )
+            }
+        }
+
         val records = scanZipCentralDirectory(channel)
         if (records.isEmpty()) {
             return ZipInspectionResult(
@@ -925,9 +997,41 @@ object RomZipExtractor {
     }
 
     private fun inspectZipStream(rawStream: InputStream, archiveName: String): ZipInspectionResult {
+        val buffered = if (rawStream is BufferedInputStream) rawStream else BufferedInputStream(rawStream, 512 * 1024)
+        if (isPayloadStream(buffered)) {
+            val summaries = PayloadDumper.inspectPayloadFromStream(buffered)
+            val entries = summaries.map { part ->
+                ZipPartitionEntry(
+                    id = "PAYLOAD:${part.name}",
+                    name = part.name,
+                    outputFileName = "${part.name}.img",
+                    sizeBytes = maxOf(0L, part.sizeBytes),
+                    origin = ZipPartitionOrigin.PAYLOAD_BIN,
+                    category = classifyPartitionCategory(part.name)
+                )
+            }
+            val sorted = sortZipPartitionEntries(entries)
+            return if (sorted.isEmpty()) {
+                ZipInspectionResult(
+                    success = false,
+                    archiveName = archiveName,
+                    hasPayloadBin = true,
+                    partitions = emptyList(),
+                    errorMessage = "No partition summaries found in payload.bin"
+                )
+            } else {
+                ZipInspectionResult(
+                    success = true,
+                    archiveName = archiveName,
+                    hasPayloadBin = true,
+                    partitions = sorted
+                )
+            }
+        }
+
         val entries = mutableListOf<ZipPartitionEntry>()
         var hasPayload = false
-        ZipInputStream(BufferedInputStream(rawStream, 512 * 1024)).use { zipIn ->
+        ZipInputStream(buffered).use { zipIn ->
             var entry = zipIn.nextEntry
             while (entry != null) {
                 val normalizedPath = entry.name.replace('\\', '/')
@@ -1029,7 +1133,21 @@ object RomZipExtractor {
         archiveDisplayName: String
     ): ZipInspectionResult = withContext(Dispatchers.IO) {
         try {
-            // 1. Seekable FileChannel path (handles STORED & DEFLATE payload/img entries in milliseconds)
+            // 0. Direct local File check for file:// scheme or direct filesystem path (< 5ms)
+            val directFile = try {
+                when {
+                    zipUri.scheme.equals("file", ignoreCase = true) -> zipUri.path?.let { File(it) }
+                    zipUri.scheme == null && !zipUri.path.isNullOrBlank() -> File(zipUri.path!!)
+                    else -> null
+                }
+            } catch (_: Exception) {
+                null
+            }
+            if (directFile != null && directFile.exists() && directFile.isFile) {
+                return@withContext inspectZipFilePartitions(directFile, archiveDisplayName)
+            }
+
+            // 1. Seekable FileChannel path (handles STORED & DEFLATE payload/img entries or raw payload.bin in milliseconds)
             val channelResult = try {
                 context.contentResolver.openFileDescriptor(zipUri, "r")?.use { pfd ->
                     FileInputStream(pfd.fileDescriptor).use { fis ->
@@ -1124,13 +1242,60 @@ object RomZipExtractor {
         val directSelections = selectedEntries.filter { it.origin == ZipPartitionOrigin.DIRECT_ZIP_ENTRY }
         val totalSelectedCount = selectedEntries.size
         val totalExpectedBytes = selectedEntries.sumOf { maxOf(0L, it.sizeBytes) }.coerceAtLeast(1L)
+        val startMs = System.currentTimeMillis()
+        var highestPct = 0
+
+        fun forwardPayloadSnapshot(snap: PayloadDumper.PayloadProgressSnapshot) {
+            val elapsedSec = maxOf(0.1, (System.currentTimeMillis() - startMs) / 1000.0)
+            val combinedDone = snap.bytesExtracted
+            val speedMb = (combinedDone / (1024.0 * 1024.0)) / elapsedSec
+            val rawPct = if (directSelections.isEmpty() && snap.completedFiles >= snap.totalFiles) {
+                100
+            } else {
+                ((combinedDone * 100L) / totalExpectedBytes).toInt().coerceIn(0, 99)
+            }
+            highestPct = maxOf(highestPct, rawPct)
+            val activeNames = snap.activeWorkers.size
+            val msg = when {
+                activeNames > 1 -> "Extracting $activeNames partitions..."
+                activeNames == 1 -> "Extracting ${snap.activeWorkers.first().partitionName}.img..."
+                else -> "Finishing payload extraction..."
+            }
+            onProgress(
+                ZipExtractionProgress(
+                    isExtracting = true,
+                    currentFile = snap.activeWorkers.firstOrNull()?.partitionName?.let { "$it.img" } ?: "",
+                    filesExtracted = snap.completedFiles,
+                    totalFiles = totalSelectedCount,
+                    totalBytesExtracted = combinedDone,
+                    totalPayloadBytes = totalExpectedBytes,
+                    speedMbPerSec = speedMb,
+                    percent = highestPct,
+                    statusMessage = msg,
+                    activeWorkers = snap.activeWorkers
+                )
+            )
+        }
+
+        // FAST PATH: Direct raw payload.bin extraction directly from FileChannel
+        if (isPayloadChannel(channel)) {
+            if (payloadSelections.isEmpty()) return emptyList()
+            if (isCancelled()) throw CancellationException("Extraction cancelled")
+            return PayloadDumper.extractPayloadFromChannel(
+                channel = channel,
+                baseOffset = 0L,
+                totalSize = channel.size(),
+                outputDir = outputDir,
+                targetPartitions = payloadSelections,
+                isCancelled = isCancelled,
+                onSnapshot = ::forwardPayloadSnapshot
+            )
+        }
 
         val records = scanZipCentralDirectory(channel)
         val outFiles = mutableListOf<File>()
         var cumulativeBytesDone = 0L
         var filesDoneCount = 0
-        val startMs = System.currentTimeMillis()
-        var highestPct = 0
 
         try {
             // 1. Extract selected payload.bin partitions
@@ -1146,38 +1311,6 @@ object RomZipExtractor {
                     .filter { it.origin == ZipPartitionOrigin.PAYLOAD_BIN }
                     .sumOf { maxOf(0L, it.sizeBytes) }
                     .coerceAtLeast(1L)
-
-                fun forwardPayloadSnapshot(snap: PayloadDumper.PayloadProgressSnapshot) {
-                    val elapsedSec = maxOf(0.1, (System.currentTimeMillis() - startMs) / 1000.0)
-                    val combinedDone = snap.bytesExtracted
-                    val speedMb = (combinedDone / (1024.0 * 1024.0)) / elapsedSec
-                    val rawPct = if (directSelections.isEmpty() && snap.completedFiles >= snap.totalFiles) {
-                        100
-                    } else {
-                        ((combinedDone * 100L) / totalExpectedBytes).toInt().coerceIn(0, 99)
-                    }
-                    highestPct = maxOf(highestPct, rawPct)
-                    val activeNames = snap.activeWorkers.size
-                    val msg = when {
-                        activeNames > 1 -> "Extracting $activeNames partitions..."
-                        activeNames == 1 -> "Extracting ${snap.activeWorkers.first().partitionName}.img..."
-                        else -> "Finishing payload extraction..."
-                    }
-                    onProgress(
-                        ZipExtractionProgress(
-                            isExtracting = true,
-                            currentFile = snap.activeWorkers.firstOrNull()?.partitionName?.let { "$it.img" } ?: "",
-                            filesExtracted = snap.completedFiles,
-                            totalFiles = totalSelectedCount,
-                            totalBytesExtracted = combinedDone,
-                            totalPayloadBytes = totalExpectedBytes,
-                            speedMbPerSec = speedMb,
-                            percent = highestPct,
-                            statusMessage = msg,
-                            activeWorkers = snap.activeWorkers
-                        )
-                    )
-                }
 
                 val dumped: List<File> = when (loc.compressionMethod) {
                     0 -> {
@@ -1452,34 +1585,67 @@ object RomZipExtractor {
                 )
             )
 
-            // Try fast seekable FileChannel path first
+            // 0. Try direct local File path first (< 5ms)
             var extractedLocalFiles: List<File>? = null
             var handledViaChannel = false
-            try {
-                context.contentResolver.openFileDescriptor(zipUri, "r")?.use { pfd ->
-                    FileInputStream(pfd.fileDescriptor).use { fis ->
-                        val ch = fis.channel
-                        if (ch.size() >= 22L) {
-                            handledViaChannel = true
-                            extractedLocalFiles = extractSelectedFromSeekableChannel(
-                                channel = ch,
-                                selectedEntries = selectedEntries,
-                                outputDir = extractionDir,
-                                tempRootDir = File(context.cacheDir, "leaf_selective_tmp/spool_$sessionId"),
-                                isCancelled = isCancelled,
-                                onLog = onLog,
-                                onProgress = ::reportProgressScaled
-                            )
-                        }
-                    }
+            val directFile = try {
+                when {
+                    zipUri.scheme.equals("file", ignoreCase = true) -> zipUri.path?.let { File(it) }
+                    zipUri.scheme == null && !zipUri.path.isNullOrBlank() -> File(zipUri.path!!)
+                    else -> null
                 }
-            } catch (ce: CancellationException) {
-                throw ce
             } catch (_: Exception) {
-                handledViaChannel = false
+                null
+            }
+            if (directFile != null && directFile.exists() && directFile.isFile) {
+                try {
+                    RandomAccessFile(directFile, "r").use { raf ->
+                        handledViaChannel = true
+                        extractedLocalFiles = extractSelectedFromSeekableChannel(
+                            channel = raf.channel,
+                            selectedEntries = selectedEntries,
+                            outputDir = extractionDir,
+                            tempRootDir = File(context.cacheDir, "leaf_selective_tmp/spool_$sessionId"),
+                            isCancelled = isCancelled,
+                            onLog = onLog,
+                            onProgress = ::reportProgressScaled
+                        )
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    handledViaChannel = false
+                }
             }
 
-            // Streaming fallback for non-seekable SAF sources
+            // 1. Try seekable FileChannel path via SAF
+            if (!handledViaChannel) {
+                try {
+                    context.contentResolver.openFileDescriptor(zipUri, "r")?.use { pfd ->
+                        FileInputStream(pfd.fileDescriptor).use { fis ->
+                            val ch = fis.channel
+                            if (ch.size() >= 22L) {
+                                handledViaChannel = true
+                                extractedLocalFiles = extractSelectedFromSeekableChannel(
+                                    channel = ch,
+                                    selectedEntries = selectedEntries,
+                                    outputDir = extractionDir,
+                                    tempRootDir = File(context.cacheDir, "leaf_selective_tmp/spool_$sessionId"),
+                                    isCancelled = isCancelled,
+                                    onLog = onLog,
+                                    onProgress = ::reportProgressScaled
+                                )
+                            }
+                        }
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    handledViaChannel = false
+                }
+            }
+
+            // 2. Streaming fallback for non-seekable SAF sources
             if (!handledViaChannel || extractedLocalFiles == null) {
                 val payloadSelections = selectedEntries
                     .filter { it.origin == ZipPartitionOrigin.PAYLOAD_BIN }
@@ -1497,7 +1663,33 @@ object RomZipExtractor {
                     )
 
                 rawStream.use { input ->
-                    ZipInputStream(BufferedInputStream(input, 512 * 1024)).use { zipIn ->
+                    val bufferedInput = if (input is BufferedInputStream) input else BufferedInputStream(input, 512 * 1024)
+                    if (isPayloadStream(bufferedInput)) {
+                        val dumped = PayloadDumper.extractPayloadFromStream(
+                            stream = bufferedInput,
+                            outputDir = extractionDir,
+                            targetPartitions = payloadSelections,
+                            isCancelled = isCancelled,
+                            onSnapshot = { snap ->
+                                reportProgressScaled(
+                                    ZipExtractionProgress(
+                                        isExtracting = true,
+                                        currentFile = snap.activeWorkers.firstOrNull()?.partitionName?.let { "$it.img" } ?: "",
+                                        filesExtracted = snap.completedFiles,
+                                        totalFiles = selectedEntries.size,
+                                        totalBytesExtracted = snap.bytesExtracted,
+                                        totalPayloadBytes = snap.totalBytes,
+                                        speedMbPerSec = snap.speedMbPerSec,
+                                        percent = snap.overallPercent,
+                                        statusMessage = "Extracting from payload.bin...",
+                                        activeWorkers = snap.activeWorkers
+                                    )
+                                )
+                            }
+                        )
+                        localResults.addAll(dumped)
+                    } else {
+                        ZipInputStream(bufferedInput).use { zipIn ->
                         var entry = zipIn.nextEntry
                         val buf = ByteArray(512 * 1024)
                         while (entry != null) {
@@ -1559,7 +1751,8 @@ object RomZipExtractor {
                         }
                     }
                 }
-                extractedLocalFiles = localResults
+            }
+            extractedLocalFiles = localResults
             }
 
             val finishedLocalFiles = extractedLocalFiles.orEmpty()

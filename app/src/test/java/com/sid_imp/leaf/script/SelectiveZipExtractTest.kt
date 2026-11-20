@@ -256,4 +256,46 @@ class SelectiveZipExtractTest {
             tempRoot.deleteRecursively()
         }
     }
+
+    @Test
+    fun testInspectAndExtractRawPayloadBinDirectly() = runBlocking {
+        val bootData = "ANDROID!BOOT_RAW_TEST".toByteArray() + ByteArray(4096 - 21) { 0x12 }
+        val initBootData = "ANDROID!INIT_RAW_TEST".toByteArray() + ByteArray(4096 - 21) { 0x34 }
+        val specs = listOf(
+            "boot" to bootData,
+            "init_boot" to initBootData
+        )
+        val payloadBytes = buildSyntheticPayload(specs)
+
+        val tempRoot = File(System.getProperty("java.io.tmpdir"), "leaf_raw_payload_test")
+        tempRoot.deleteRecursively()
+        tempRoot.mkdirs()
+
+        try {
+            val rawPayloadFile = File(tempRoot, "payload.bin")
+            rawPayloadFile.writeBytes(payloadBytes)
+
+            // Inspect raw payload.bin directly
+            val inspection = RomZipExtractor.inspectZipFilePartitions(rawPayloadFile)
+            assertTrue("Raw payload inspection must succeed: ${inspection.errorMessage}", inspection.success)
+            assertTrue(inspection.hasPayloadBin)
+            assertEquals(2, inspection.partitions.size)
+            assertEquals(listOf("init_boot", "boot"), inspection.partitions.map { it.name })
+
+            // Extract selected init_boot directly from raw payload
+            val outDir = File(tempRoot, "out_raw")
+            val selected = inspection.partitions.filter { it.name == "init_boot" }
+            val extracted = RomZipExtractor.extractSelectedPartitionsToDir(
+                zipFile = rawPayloadFile,
+                selectedEntries = selected,
+                outputDir = outDir
+            )
+            assertEquals(1, extracted.size)
+            val outFile = File(outDir, "init_boot.img")
+            assertTrue(outFile.exists())
+            assertArrayEquals(initBootData, outFile.readBytes())
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
 }

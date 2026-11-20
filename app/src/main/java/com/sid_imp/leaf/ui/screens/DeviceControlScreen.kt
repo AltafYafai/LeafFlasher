@@ -152,7 +152,7 @@ fun DeviceControlScreen(
                                 ) {
                                     if (customCommand.isEmpty()) {
                                         Text(
-                                            text = if (isAdb) "Enter adb / shell command..." else "Enter fastboot command...",
+                                            text = if (isAdb) "e.g. adb shell, reboot bootloader, devices..." else "e.g. fastboot erase frp, -w, getvar all...",
                                             fontSize = metrics.captionSp.sp,
                                             color = OneUiTextMuted,
                                             fontFamily = FontFamily.Monospace,

@@ -176,7 +176,8 @@ fun UnifiedRomPickerDialog(
                     val isDir = f.isDirectory
                     val name = f.name
                     val low = name.lowercase(Locale.US)
-                    val isZip = !isDir && low.endsWith(".zip")
+                    val isPayload = !isDir && (low == "payload.bin" || (low.endsWith(".bin") && !low.endsWith(".sh")))
+                    val isZip = !isDir && (low.endsWith(".zip") || isPayload)
                     if (zipOnlyMode && !isDir && !isZip) {
                         return@mapNotNull null
                     }
@@ -268,7 +269,7 @@ fun UnifiedRomPickerDialog(
                         )
                         Text(
                             text = if (zipOnlyMode) {
-                                "Pick a .zip archive to extract .img files"
+                                "Pick a .zip or payload.bin to extract .img files"
                             } else {
                                 "Pick a .zip file or a ROM folder"
                             },
