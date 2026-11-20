@@ -77,12 +77,6 @@ Every release APK is built transparently from source by [GitHub Actions](.github
 sha256sum -c LeafFlasher-by-sid-v2.2.0.apk.sha256
 ```
 
-To verify your downloaded APK matches the published checksum:
-
-```bash
-sha256sum -c LeafFlasher-by-sid-v2.2.0.apk.sha256
-```
-
 ---
 
 ## 📸 Screenshots
