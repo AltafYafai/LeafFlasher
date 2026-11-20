@@ -4,13 +4,16 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
+import com.sid_imp.leaf.util.LeafLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.BufferedInputStream
 import java.io.FileInputStream
+import java.io.IOException
 import java.io.InputStream
+import java.io.OutputStream
 import java.nio.charset.StandardCharsets
 
 class FastbootUsbDevice(
@@ -522,6 +525,54 @@ class FastbootUsbDevice(
         FastbootResponse(ResponseType.OKAY, "Chunked flash successful")
     }
 
+    private class UsbBulkOutputStream(
+        private val bufferSize: Int = FastbootConstants.BULK_CHUNK_SIZE,
+        private val onBytesSent: (Int) -> Unit = {},
+        private val writeBlock: (buffer: ByteArray, offset: Int, length: Int) -> Boolean
+    ) : OutputStream() {
+        private val buf = ByteArray(bufferSize)
+        private var count = 0
+
+        override fun write(b: Int) {
+            buf[count++] = b.toByte()
+            if (count == bufferSize) {
+                flushBuffer()
+            }
+        }
+
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            var currOff = off
+            var rem = len
+            while (rem > 0) {
+                val space = bufferSize - count
+                val toCopy = minOf(space, rem)
+                System.arraycopy(b, currOff, buf, count, toCopy)
+                count += toCopy
+                currOff += toCopy
+                rem -= toCopy
+                if (count == bufferSize) {
+                    flushBuffer()
+                }
+            }
+        }
+
+        private fun flushBuffer() {
+            if (count > 0) {
+                val toWrite = count
+                count = 0
+                val ok = writeBlock(buf, 0, toWrite)
+                if (!ok) {
+                    throw IOException("USB bulk write failed ($toWrite bytes)")
+                }
+                onBytesSent(toWrite)
+            }
+        }
+
+        override fun flush() {
+            flushBuffer()
+        }
+    }
+
     private suspend fun flashSparsePlan(
         partition: String,
         slices: List<SparseChunkHelper.SparseSlicePlan>,
@@ -530,13 +581,19 @@ class FastbootUsbDevice(
         progressCallback: (bytesSent: Long, totalBytes: Long) -> Unit,
         infoCallback: (String) -> Unit
     ): FastbootResponse = withContext(Dispatchers.IO) {
+        LeafLogger.log("flashSparsePlan START: partition=$partition, totalBytes=$totalBytes, slices=${slices.size}")
         var totalSentAcrossChunks = 0L
         var lastProgressEmitMs = 0L
 
         for (slice in slices) {
-            if (!connected) return@withContext FastbootResponse(ResponseType.ERROR, "Device disconnected during chunk flash")
+            if (!connected) {
+                val err = "Device disconnected during chunk flash"
+                LeafLogger.logError(err)
+                return@withContext FastbootResponse(ResponseType.ERROR, err)
+            }
 
             infoCallback("Flashing chunk ${slice.sliceIndex + 1}/${slices.size} of $partition...")
+            LeafLogger.log("Flashing slice ${slice.sliceIndex + 1}/${slices.size}: wireBytes=${slice.wireBytes}, startBlock=${slice.startBlock}, sliceBlocks=${slice.sliceBlocks}, chunkCount=${slice.chunks.size}")
 
             val sliceHeaderBytes = SparseChunkHelper.createSliceSparseHeader(
                 totalBlks = slice.startBlock + slice.sliceBlocks,
@@ -545,7 +602,12 @@ class FastbootUsbDevice(
                 startBlock = slice.startBlock
             )
 
-            val inStream = openStream() ?: return@withContext FastbootResponse(ResponseType.ERROR, "Cannot open stream at chunk ${slice.sliceIndex + 1}")
+            val inStream = openStream() ?: run {
+                val err = "Cannot open stream at chunk ${slice.sliceIndex + 1}"
+                LeafLogger.logError(err)
+                return@withContext FastbootResponse(ResponseType.ERROR, err)
+            }
+
             val dlAckResp: FastbootResponse = try {
                 val bufferedStream = if (inStream is BufferedInputStream) inStream else BufferedInputStream(inStream, FastbootConstants.STREAM_BUFFER_SIZE)
 
@@ -559,40 +621,59 @@ class FastbootUsbDevice(
                     val cmdBytes = "${FastbootConstants.CMD_DOWNLOAD}$hexSize".toByteArray(StandardCharsets.US_ASCII)
                     val sent = sendCommandPacket(cmdBytes, FastbootConstants.DEFAULT_TIMEOUT_MS)
                     if (sent < 0) {
-                        return@withLock FastbootResponse(ResponseType.ERROR, "USB download command failed ($sent) for chunk ${slice.sliceIndex + 1}")
+                        val err = "USB download command failed ($sent) for chunk ${slice.sliceIndex + 1}"
+                        LeafLogger.logError(err)
+                        return@withLock FastbootResponse(ResponseType.ERROR, err)
                     }
 
                     val dlResp = readResponse(FastbootConstants.DEFAULT_TIMEOUT_MS) {}
+                    LeafLogger.log("Slice ${slice.sliceIndex + 1} download response: [${dlResp.type}] ${dlResp.payload}")
                     if (dlResp.type != ResponseType.DATA) {
                         return@withLock dlResp
                     }
 
-                    // 2. Upload sparse header + optional DONT_CARE header
-                    if (!writeBulkBuffer(sliceHeaderBytes, 0, sliceHeaderBytes.size)) {
-                        val detail = lastUsbFailureDetail.ifBlank { "transfer interrupted" }
-                        return@withLock FastbootResponse(ResponseType.ERROR, "Failed writing sparse header of chunk ${slice.sliceIndex + 1} ($detail)")
-                    }
+                    // 2. Stream data continuously through UsbBulkOutputStream to prevent premature short packets
+                    var sliceBytesSent = 0L
+                    val usbOut = UsbBulkOutputStream(
+                        bufferSize = FastbootConstants.BULK_CHUNK_SIZE,
+                        onBytesSent = { written ->
+                            sliceBytesSent += written
+                            totalSentAcrossChunks += written
+                            val now = System.currentTimeMillis()
+                            if (now - lastProgressEmitMs >= 100L || totalSentAcrossChunks >= totalBytes) {
+                                lastProgressEmitMs = now
+                                progressCallback(totalSentAcrossChunks, totalBytes)
+                            }
+                        },
+                        writeBlock = { buf, off, len ->
+                            writeBulkBuffer(buf, off, len)
+                        }
+                    )
+
+                    // Write sparse header into output stream buffer
+                    usbOut.write(sliceHeaderBytes)
 
                     var currentStreamPos = 0L
-                    val buffer = ByteArray(FastbootConstants.BULK_CHUNK_SIZE)
+                    val readBuffer = ByteArray(FastbootConstants.BULK_CHUNK_SIZE)
+                    val skipScratch = ByteArray(16 * 1024)
 
                     // 3. For each planned chunk in slice:
-                    for (chunk in slice.chunks) {
-                        // Send 12-byte chunk header
+                    for ((chunkIdx, chunk) in slice.chunks.withIndex()) {
+                        // Write 12-byte chunk header
                         val chunkHdr = SparseChunkHelper.createChunkHeader(chunk.chunkType, chunk.chunkBlocks, chunk.totalSz)
-                        if (!writeBulkBuffer(chunkHdr, 0, chunkHdr.size)) {
-                            return@withLock FastbootResponse(ResponseType.ERROR, "Failed writing chunk header in slice ${slice.sliceIndex + 1}")
-                        }
+                        usbOut.write(chunkHdr)
 
-                        // Seek to chunk data offset if needed
+                        // Seek/skip to chunk data offset if needed
                         if (currentStreamPos < chunk.dataStreamOffset) {
                             val toSkip = chunk.dataStreamOffset - currentStreamPos
                             var skipped = 0L
                             while (skipped < toSkip) {
                                 val s = bufferedStream.skip(toSkip - skipped)
                                 if (s <= 0) {
-                                    val r = bufferedStream.read(buffer, 0, minOf(buffer.size.toLong(), toSkip - skipped).toInt())
-                                    if (r <= 0) break
+                                    val r = bufferedStream.read(skipScratch, 0, minOf(skipScratch.size.toLong(), toSkip - skipped).toInt())
+                                    if (r <= 0) {
+                                        throw IOException("Stream EOF during skip to offset ${chunk.dataStreamOffset} (skipped $skipped / $toSkip)")
+                                    }
                                     skipped += r
                                 } else {
                                     skipped += s
@@ -601,33 +682,35 @@ class FastbootUsbDevice(
                             currentStreamPos = chunk.dataStreamOffset
                         }
 
-                        // Stream chunk data
+                        // Stream chunk data bytes
                         var chunkBytesSent = 0L
                         while (chunkBytesSent < chunk.dataLength && connected) {
-                            val toRead = minOf(buffer.size.toLong(), chunk.dataLength - chunkBytesSent).toInt()
-                            val r = readFullyUpTo(bufferedStream, buffer, 0, toRead)
-                            if (r <= 0) break
-
-                            if (!writeBulkBuffer(buffer, 0, r)) {
-                                return@withLock FastbootResponse(ResponseType.ERROR, "Failed streaming chunk data in slice ${slice.sliceIndex + 1}")
+                            val toRead = minOf(readBuffer.size.toLong(), chunk.dataLength - chunkBytesSent).toInt()
+                            val r = readFullyUpTo(bufferedStream, readBuffer, 0, toRead)
+                            if (r <= 0) {
+                                throw IOException("Stream EOF reading chunk data: read $chunkBytesSent of ${chunk.dataLength} bytes in chunk $chunkIdx")
                             }
+                            usbOut.write(readBuffer, 0, r)
                             chunkBytesSent += r
                             currentStreamPos += r
-                            totalSentAcrossChunks += r
-
-                            val now = System.currentTimeMillis()
-                            if (now - lastProgressEmitMs >= 100L || totalSentAcrossChunks >= totalBytes) {
-                                lastProgressEmitMs = now
-                                progressCallback(totalSentAcrossChunks, totalBytes)
-                            }
                         }
                     }
 
+                    // Flush all remaining buffered bytes to USB
+                    usbOut.flush()
+
+                    LeafLogger.log("Slice ${slice.sliceIndex + 1} stream complete. Uploaded $sliceBytesSent wire bytes. Awaiting fastboot ack...")
+
                     // 4. Acknowledge download
-                    readResponse(FastbootConstants.DOWNLOAD_TIMEOUT_MS) {}
+                    val ackResp = readResponse(FastbootConstants.DOWNLOAD_TIMEOUT_MS) {}
+                    LeafLogger.log("Slice ${slice.sliceIndex + 1} ack: [${ackResp.type}] ${ackResp.payload}")
+                    ackResp
                 }
             } catch (e: Exception) {
-                FastbootResponse(ResponseType.ERROR, "Chunk ${slice.sliceIndex + 1} error: ${e.message}")
+                val detail = lastUsbFailureDetail.ifBlank { e.message ?: "unknown" }
+                val errMsg = "Chunk ${slice.sliceIndex + 1} error: $detail"
+                LeafLogger.logError(errMsg, e)
+                FastbootResponse(ResponseType.ERROR, errMsg)
             } finally {
                 try { inStream.close() } catch (_: Exception) {}
             }
@@ -637,12 +720,15 @@ class FastbootUsbDevice(
             }
 
             // 5. Flash chunk to partition
+            LeafLogger.log("CMD >> ${FastbootConstants.CMD_FLASH}$partition")
             val flashResp = sendCommand("${FastbootConstants.CMD_FLASH}$partition", FastbootConstants.FLASH_TIMEOUT_MS, infoCallback)
+            LeafLogger.log("CMD << [${flashResp.type}] ${flashResp.payload}")
             if (!flashResp.isSuccess) {
                 return@withContext flashResp
             }
         }
 
+        LeafLogger.log("flashSparsePlan completed successfully for $partition")
         FastbootResponse(ResponseType.OKAY, "Chunked flash successful")
     }
 

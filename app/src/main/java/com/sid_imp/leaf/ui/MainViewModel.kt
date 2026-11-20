@@ -11,6 +11,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.sid_imp.leaf.fastboot.*
 import com.sid_imp.leaf.script.*
+import com.sid_imp.leaf.util.LeafLogger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -227,9 +228,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var baseScriptTasks: List<FlashTask>? = null
 
     init {
+        LeafLogger.init(application)
         usbManager.onDiagnosticLog = { msg -> flashExecutor.addLog(msg) }
         usbManager.start()
         flashExecutor.addLog("Leaf Flasher ready")
+    }
+
+    fun shareLogFile() {
+        LeafLogger.shareLogFile(context)
     }
 
     override fun onCleared() {

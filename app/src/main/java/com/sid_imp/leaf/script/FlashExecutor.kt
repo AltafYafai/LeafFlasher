@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
 import com.sid_imp.leaf.fastboot.*
+import com.sid_imp.leaf.util.LeafLogger
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -57,7 +58,7 @@ class FlashExecutor(
     @Volatile private var isCancelled = false
 
     companion object {
-        private const val MAX_LOG_LINES = 250
+        private const val MAX_LOG_LINES = 5000
         private const val PROGRESS_EMIT_INTERVAL_MS = 65L
         private val KNOWN_LOGICAL_STEMS = setOf(
             "odm_dlkm", "odm", "vendor_dlkm", "product", "vendor",
@@ -105,6 +106,7 @@ class FlashExecutor(
             .replace(Regex("\\s+"), " ")
             .trim()
         if (clean.isEmpty()) return
+        LeafLogger.log(clean)
         synchronized(logLock) {
             val current = _logFlow.value
             if (current.lastOrNull() == clean) return
