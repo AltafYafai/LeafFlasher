@@ -9,6 +9,12 @@
 by **sid_imp** ([GitHub `@devvsid`](https://github.com/devvsid) · [Telegram `@sid_imp`](https://t.me/sid_imp))
 
 <p>
+  <a href="https://github.com/devvsid/LeafFlasher/releases/latest/download/LeafFlasher-latest.apk">
+    <img src="https://img.shields.io/badge/Direct%20Download-APK-10B981?style=for-the-badge&logo=android&logoColor=white" alt="Direct Download APK" />
+  </a>
+  <a href="https://apps.obtainium.imranr.dev/redirect?r=obtainium://app/%7B%22id%22%3A%22com.sid_imp.leaf%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2Fdevvsid%2FLeafFlasher%22%2C%22author%22%3A%22sid_imp%22%2C%22name%22%3A%22Leaf%20Flasher%22%7D">
+    <img src="https://img.shields.io/badge/Obtainium-Add%20App-4F46E5?style=for-the-badge&logo=android&logoColor=white" alt="Add to Obtainium" />
+  </a>
   <a href="https://github.com/devvsid/LeafFlasher/releases/latest">
     <img src="https://img.shields.io/github/v/release/devvsid/LeafFlasher?style=for-the-badge&color=10b981&label=Release" alt="Latest Release" />
   </a>
@@ -27,7 +33,7 @@ by **sid_imp** ([GitHub `@devvsid`](https://github.com/devvsid) · [Telegram `@s
 </p>
 
 <p>
-  <a href="#-download--verify-apk">Download APK</a> •
+  <a href="#-download--install">Download APK</a> •
   <a href="#-screenshots">Screenshots</a> •
   <a href="#-at-a-glance">At a Glance</a> •
   <a href="#-every-feature-explained">All Features</a> •
@@ -46,12 +52,40 @@ Designed in a clean dark theme with step-by-step guidance and plain, everyday wo
 
 ---
 
-## 📦 Download & Verify APK
+## 📦 Download & Install
+
+<div align="center">
+
+<a href="https://github.com/devvsid/LeafFlasher/releases/latest/download/LeafFlasher-latest.apk">
+  <img src="https://img.shields.io/badge/Direct%20Download-Latest%20APK-10B981?style=for-the-badge&logo=android&logoColor=white" height="42" alt="Direct Download APK" />
+</a>
+&nbsp;&nbsp;
+<a href="https://apps.obtainium.imranr.dev/redirect?r=obtainium://app/%7B%22id%22%3A%22com.sid_imp.leaf%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2Fdevvsid%2FLeafFlasher%22%2C%22author%22%3A%22sid_imp%22%2C%22name%22%3A%22Leaf%20Flasher%22%7D">
+  <img src="fastlane/metadata/android/en-US/images/badge_obtainium.png" height="42" alt="Get it on Obtainium" />
+</a>
+&nbsp;&nbsp;
+<a href="https://github.com/devvsid/LeafFlasher/releases/latest">
+  <img src="https://img.shields.io/badge/GitHub-All%20Releases-181717?style=for-the-badge&logo=github&logoColor=white" height="42" alt="GitHub Releases" />
+</a>
+
+</div>
+
+### Download Options
+
+| Method | Link | Description |
+| --- | --- | --- |
+| **Direct APK** | [**Download Latest APK**](https://github.com/devvsid/LeafFlasher/releases/latest/download/LeafFlasher-latest.apk) | Direct single-click download of the latest release APK (`LeafFlasher-latest.apk`). |
+| **Obtainium** | [**Add to Obtainium**](https://apps.obtainium.imranr.dev/redirect?r=obtainium://app/%7B%22id%22%3A%22com.sid_imp.leaf%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2Fdevvsid%2FLeafFlasher%22%2C%22author%22%3A%22sid_imp%22%2C%22name%22%3A%22Leaf%20Flasher%22%7D) | One-tap install and automated background update tracking directly from this GitHub repo. |
+| **GitHub Releases** | [**Releases Page**](https://github.com/devvsid/LeafFlasher/releases) | View all versioned releases, changelogs, and SHA-256 checksum files. |
+| **F-Droid** | [**RFP #4779**](https://gitlab.com/fdroid/rfp/-/work_items/4779) / [**MR !56912**](https://gitlab.com/fdroid/fdroiddata/-/merge_requests/56912) | Official F-Droid package review in progress. |
+
+#### 📲 Adding to Obtainium
+- **One-Tap:** Tap the [**Get it on Obtainium**](https://apps.obtainium.imranr.dev/redirect?r=obtainium://app/%7B%22id%22%3A%22com.sid_imp.leaf%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2Fdevvsid%2FLeafFlasher%22%2C%22author%22%3A%22sid_imp%22%2C%22name%22%3A%22Leaf%20Flasher%22%7D) button above on your Android phone to automatically add Leaf Flasher.
+- **Manual:** In Obtainium, tap **Add App**, paste `https://github.com/devvsid/LeafFlasher`, and tap **Add**.
+
+### Checksum Verification
 
 Every release APK is built transparently from source by [GitHub Actions](.github/workflows/build-and-release.yml) and published under [**GitHub Releases**](https://github.com/devvsid/LeafFlasher/releases) alongside its SHA-256 checksum:
-
-- **Latest Release:** https://github.com/devvsid/LeafFlasher/releases/latest
-- **All Releases:** https://github.com/devvsid/LeafFlasher/releases
 
 To verify your downloaded APK matches the published checksum:
 

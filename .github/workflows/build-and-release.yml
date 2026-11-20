@@ -122,6 +122,7 @@ jobs:
             echo "Signed release APK output not found; refusing to publish an unsigned APK!" >&2
             exit 1
           fi
+          cp "dist/${APK_NAME}" dist/LeafFlasher-latest.apk
 
           (cd dist && sha256sum "${APK_NAME}" > "${APK_NAME}.sha256")
           APK_SHA256=$(cut -d' ' -f1 "dist/${APK_NAME}.sha256")
@@ -158,8 +159,9 @@ jobs:
             echo "### What's New in ${TAG_NAME}"
             printf '%s\n' "${TAG_NOTES}"
             echo ''
-            echo '### Release Files'
-            echo "- **APK:** \`${APK_NAME}\` (\`versionCode ${VERSION_CODE}\`)"
+            echo '### Release Files & Direct Download'
+            echo "- **Direct Download (Latest APK):** [\`LeafFlasher-latest.apk\`](https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/LeafFlasher-latest.apk)"
+            echo "- **Versioned APK:** \`${APK_NAME}\` (\`versionCode ${VERSION_CODE}\`)"
             echo "- **SHA-256:** \`${APK_SHA256}\`"
             echo ''
             if [ "${HAS_SIGNING_KEY}" != "true" ]; then
@@ -170,8 +172,11 @@ jobs:
             echo "sha256sum -c ${APK_NAME}.sha256"
             echo '```'
             echo ''
+            echo '### Install & Auto-Updates'
+            echo "- **Obtainium:** [Add to Obtainium (One-Tap)](https://apps.obtainium.imranr.dev/redirect?r=obtainium://app/%7B%22id%22%3A%22com.sid_imp.leaf%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2F${GITHUB_REPOSITORY}%22%2C%22author%22%3A%22sid_imp%22%2C%22name%22%3A%22Leaf%20Flasher%22%7D) or paste \`https://github.com/${GITHUB_REPOSITORY}\` into Obtainium."
+            echo ''
             echo '### Links'
-            echo "- Feature guide & build instructions: [README](https://github.com/${GITHUB_REPOSITORY}#readme)"
+            echo "- Feature guide, screenshots & build instructions: [README](https://github.com/${GITHUB_REPOSITORY}#readme)"
             echo '- F-Droid Request for Packaging: [fdroid/rfp#4779](https://gitlab.com/fdroid/rfp/-/work_items/4779)'
             echo '- Telegram: [@sid_imp](https://t.me/sid_imp)'
           } > dist/release-body.md
