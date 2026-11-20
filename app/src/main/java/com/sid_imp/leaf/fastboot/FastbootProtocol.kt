@@ -337,11 +337,12 @@ class FastbootUsbDevice(
         val queriedLimit = (cachedDeviceInfo?.maxDownloadSize?.takeIf { it > 0 }
             ?: parseHexOrDec(try { getVariable("max-download-size") } catch (_: Exception) { null }))
 
-        // Respect the hardware buffer limit (up to 1GB safe upper bound for USB), or default to 768MB
+        // Respect the hardware buffer limit (up to 1GB safe upper bound for USB), or default to 255MB
+        // (matching AOSP fastbootd kMaxDownloadSizeDefault = 0x10000000 / 256MB)
         val maxChunkLimit = when {
             queriedLimit in (64 * 1024 * 1024L)..(1024 * 1024 * 1024L) -> queriedLimit - (1024 * 1024L) // 1MB safety margin
             queriedLimit > 1024 * 1024 * 1024L -> 1024 * 1024 * 1024L
-            else -> 768 * 1024 * 1024L // 768 MB default for modern Android Fastboot/Fastbootd
+            else -> 255 * 1024 * 1024L // Safe default: 255MB (never exceed 256MB buffer)
         }
 
         // Probe if image is already an Android sparse file (0xed26ff3a)
@@ -354,14 +355,23 @@ class FastbootUsbDevice(
             false
         }
 
-        // If file fits within hardware download limit, or is an already-sparse image fitting in device buffer, flash directly!
-        val canFlashDirectly = totalBytes <= maxChunkLimit || (isAlreadySparse && (queriedLimit <= 0 || totalBytes <= maxOf(queriedLimit, 1024 * 1024 * 1024L)))
-        if (canFlashDirectly) {
+        // If file fits within hardware download limit, flash directly!
+        if (totalBytes <= maxChunkLimit) {
             val stream = openStream() ?: return@withContext FastbootResponse(ResponseType.ERROR, "Cannot open stream for $partition")
             return@withContext try {
                 flashPartition(partition, stream, totalBytes, progressCallback, infoCallback)
             } finally {
                 try { stream.close() } catch (_: Exception) {}
+            }
+        }
+
+        // File genuinely exceeds max download size!
+        // If image is already an Android sparse file, use chunk-aware sparse resparsing
+        // rather than raw slicing to prevent corrupting the sparse container.
+        if (isAlreadySparse) {
+            val sparsePlan = SparseChunkHelper.buildSparseResparsePlan(openStream, maxChunkLimit)
+            if (sparsePlan != null && sparsePlan.isNotEmpty()) {
+                return@withContext flashSparsePlan(partition, sparsePlan, totalBytes, openStream, progressCallback, infoCallback)
             }
         }
 
@@ -494,6 +504,130 @@ class FastbootUsbDevice(
                 }
             } catch (e: Exception) {
                 FastbootResponse(ResponseType.ERROR, "Chunk ${sliceIndex + 1} error: ${e.message}")
+            } finally {
+                try { inStream.close() } catch (_: Exception) {}
+            }
+
+            if (!dlAckResp.isSuccess) {
+                return@withContext dlAckResp
+            }
+
+            // 5. Flash chunk to partition
+            val flashResp = sendCommand("${FastbootConstants.CMD_FLASH}$partition", FastbootConstants.FLASH_TIMEOUT_MS, infoCallback)
+            if (!flashResp.isSuccess) {
+                return@withContext flashResp
+            }
+        }
+
+        FastbootResponse(ResponseType.OKAY, "Chunked flash successful")
+    }
+
+    private suspend fun flashSparsePlan(
+        partition: String,
+        slices: List<SparseChunkHelper.SparseSlicePlan>,
+        totalBytes: Long,
+        openStream: () -> InputStream?,
+        progressCallback: (bytesSent: Long, totalBytes: Long) -> Unit,
+        infoCallback: (String) -> Unit
+    ): FastbootResponse = withContext(Dispatchers.IO) {
+        var totalSentAcrossChunks = 0L
+        var lastProgressEmitMs = 0L
+
+        for (slice in slices) {
+            if (!connected) return@withContext FastbootResponse(ResponseType.ERROR, "Device disconnected during chunk flash")
+
+            infoCallback("Flashing chunk ${slice.sliceIndex + 1}/${slices.size} of $partition...")
+
+            val sliceHeaderBytes = SparseChunkHelper.createSliceSparseHeader(
+                totalBlks = slice.startBlock + slice.sliceBlocks,
+                totalChunks = slice.chunks.size + (if (slice.startBlock > 0L) 1 else 0),
+                blkSz = slice.blkSz,
+                startBlock = slice.startBlock
+            )
+
+            val inStream = openStream() ?: return@withContext FastbootResponse(ResponseType.ERROR, "Cannot open stream at chunk ${slice.sliceIndex + 1}")
+            val dlAckResp: FastbootResponse = try {
+                val bufferedStream = if (inStream is BufferedInputStream) inStream else BufferedInputStream(inStream, FastbootConstants.STREAM_BUFFER_SIZE)
+
+                mutex.withLock {
+                    if (!connected) {
+                        return@withLock FastbootResponse(ResponseType.ERROR, "Device disconnected")
+                    }
+
+                    // 1. Send download command for this slice
+                    val hexSize = String.format("%08x", slice.wireBytes)
+                    val cmdBytes = "${FastbootConstants.CMD_DOWNLOAD}$hexSize".toByteArray(StandardCharsets.US_ASCII)
+                    val sent = sendCommandPacket(cmdBytes, FastbootConstants.DEFAULT_TIMEOUT_MS)
+                    if (sent < 0) {
+                        return@withLock FastbootResponse(ResponseType.ERROR, "USB download command failed ($sent) for chunk ${slice.sliceIndex + 1}")
+                    }
+
+                    val dlResp = readResponse(FastbootConstants.DEFAULT_TIMEOUT_MS) {}
+                    if (dlResp.type != ResponseType.DATA) {
+                        return@withLock dlResp
+                    }
+
+                    // 2. Upload sparse header + optional DONT_CARE header
+                    if (!writeBulkBuffer(sliceHeaderBytes, 0, sliceHeaderBytes.size)) {
+                        val detail = lastUsbFailureDetail.ifBlank { "transfer interrupted" }
+                        return@withLock FastbootResponse(ResponseType.ERROR, "Failed writing sparse header of chunk ${slice.sliceIndex + 1} ($detail)")
+                    }
+
+                    var currentStreamPos = 0L
+                    val buffer = ByteArray(FastbootConstants.BULK_CHUNK_SIZE)
+
+                    // 3. For each planned chunk in slice:
+                    for (chunk in slice.chunks) {
+                        // Send 12-byte chunk header
+                        val chunkHdr = SparseChunkHelper.createChunkHeader(chunk.chunkType, chunk.chunkBlocks, chunk.totalSz)
+                        if (!writeBulkBuffer(chunkHdr, 0, chunkHdr.size)) {
+                            return@withLock FastbootResponse(ResponseType.ERROR, "Failed writing chunk header in slice ${slice.sliceIndex + 1}")
+                        }
+
+                        // Seek to chunk data offset if needed
+                        if (currentStreamPos < chunk.dataStreamOffset) {
+                            val toSkip = chunk.dataStreamOffset - currentStreamPos
+                            var skipped = 0L
+                            while (skipped < toSkip) {
+                                val s = bufferedStream.skip(toSkip - skipped)
+                                if (s <= 0) {
+                                    val r = bufferedStream.read(buffer, 0, minOf(buffer.size.toLong(), toSkip - skipped).toInt())
+                                    if (r <= 0) break
+                                    skipped += r
+                                } else {
+                                    skipped += s
+                                }
+                            }
+                            currentStreamPos = chunk.dataStreamOffset
+                        }
+
+                        // Stream chunk data
+                        var chunkBytesSent = 0L
+                        while (chunkBytesSent < chunk.dataLength && connected) {
+                            val toRead = minOf(buffer.size.toLong(), chunk.dataLength - chunkBytesSent).toInt()
+                            val r = readFullyUpTo(bufferedStream, buffer, 0, toRead)
+                            if (r <= 0) break
+
+                            if (!writeBulkBuffer(buffer, 0, r)) {
+                                return@withLock FastbootResponse(ResponseType.ERROR, "Failed streaming chunk data in slice ${slice.sliceIndex + 1}")
+                            }
+                            chunkBytesSent += r
+                            currentStreamPos += r
+                            totalSentAcrossChunks += r
+
+                            val now = System.currentTimeMillis()
+                            if (now - lastProgressEmitMs >= 100L || totalSentAcrossChunks >= totalBytes) {
+                                lastProgressEmitMs = now
+                                progressCallback(totalSentAcrossChunks, totalBytes)
+                            }
+                        }
+                    }
+
+                    // 4. Acknowledge download
+                    readResponse(FastbootConstants.DOWNLOAD_TIMEOUT_MS) {}
+                }
+            } catch (e: Exception) {
+                FastbootResponse(ResponseType.ERROR, "Chunk ${slice.sliceIndex + 1} error: ${e.message}")
             } finally {
                 try { inStream.close() } catch (_: Exception) {}
             }
